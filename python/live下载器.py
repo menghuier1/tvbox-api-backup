@@ -4,6 +4,7 @@
 
 功能：
 1. 扫描 tvbox/ 下所有接口 JSON，从 lives 数组提取有 name+url 的全部条目
+   （兼容数组根节点、单对象 lives、单条直出等多种结构，见 extract_lives）
 2. 不限制 type，不做任何过滤，URL 去重
 3. 模拟 TVBox 环境下载（UA 伪装、指纹），失败重试
 4. 套壳自动展开（最多5层），最终层写出播放列表文件
@@ -213,6 +214,52 @@ def download_one(live, _chain=None):
 
 
 # ---------- 扫描与聚合 ----------
+def looks_like_live(item):
+    """判断一个对象是否像直播源条目：有非空 name，且 url 是 http(s) 地址。"""
+    if not isinstance(item, dict):
+        return False
+    name = item.get("name", "")
+    url = item.get("url", "")
+    return (isinstance(name, str) and bool(name.strip())
+            and isinstance(url, str)
+            and url.strip().startswith(("http://", "https://")))
+
+
+def extract_lives(data):
+    """兼容各类接口 JSON 根结构，返回 (lives列表, 结构说明)。
+
+    接口文件根节点并不总是 {"lives": [...]}，实测还遇到过：
+      - dict，lives 是单个对象而非数组
+      - dict 本身就是一条直播源
+      - list 根节点，元素直接就是直播源条目
+      - list 根节点但是多仓/导航结构 [{name, list:[{name,url,...}]}]，不属于直播源
+      - str / null 等完全无关的内容
+
+    以前直接写 data.get("lives", [])，遇到 list 根节点会抛
+    AttributeError: 'list' object has no attribute 'get'，把整次聚合中断。
+    """
+    if isinstance(data, dict):
+        lives = data.get("lives")
+        if isinstance(lives, list):
+            return lives, "dict.lives"
+        if isinstance(lives, dict):
+            return [lives], "dict.lives(单对象)"
+        if looks_like_live(data):
+            return [data], "dict(单条直出)"
+        return [], "dict(无 lives 字段)"
+
+    if isinstance(data, list):
+        # 多仓/导航结构，分组里的 url 是站点或下载包地址，不是直播源，必须排除
+        if any(isinstance(x, dict) and ("list" in x or "sites" in x) for x in data):
+            return [], f"list({len(data)} 个分组，多仓/导航结构)"
+        picked = [x for x in data if looks_like_live(x)]
+        if picked:
+            return picked, "list(lives 数组)"
+        return [], f"list({len(data)} 个元素，无可用直播源)"
+
+    return [], f"{type(data).__name__}(不支持的结构)"
+
+
 def scan_interfaces():
     print("\n[1/4] 扫描接口文件，提取 lives ...")
     all_lives = []
@@ -229,20 +276,35 @@ def scan_interfaces():
         try:
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             print(f"  跳过 {json_file.name}: {e}")
             continue
 
-        lives = data.get("lives", [])
-        if not isinstance(lives, list):
+        # 结构归一化：任何形态的文件都不能中断整次运行
+        try:
+            lives, note = extract_lives(data)
+        except Exception as e:
+            print(f"  跳过 {json_file.name}: 结构解析异常 {e}")
+            continue
+
+        if DEBUG:
+            print(f"      [structure] {json_file.name} -> {note}")
+
+        if not lives:
+            print(f"  跳过 {json_file.name}: {note}")
             continue
 
         valid = 0
         for item in lives:
             if not isinstance(item, dict):
                 continue
-            item_name = item.get("name", "").strip()
-            item_url = item.get("url", "").strip()
+            # name / url 可能不是字符串（缺失、null、数字），不能直接 .strip()
+            raw_name = item.get("name") or ""
+            raw_url = item.get("url") or ""
+            if not isinstance(raw_name, str) or not isinstance(raw_url, str):
+                continue
+            item_name = raw_name.strip()
+            item_url = raw_url.strip()
             # 有名称且有URL，全部提取
             if not item_name or not item_url:
                 continue
@@ -257,7 +319,7 @@ def scan_interfaces():
             all_lives.append({
                 "name": item_name,
                 "url": item_url,
-                "ua": item.get("ua", ""),
+                "ua": item.get("ua", "") if isinstance(item.get("ua", ""), str) else "",
                 "source": source,
             })
             valid += 1
@@ -335,7 +397,10 @@ def generate_livelist(lives, results):
             continue
         _, size, disk_filename, final_url = results[name]
         source = Path(live['source']).stem
-        ua = (live.get("ua") or "").strip()
+        ua = live.get("ua") or ""
+        if not isinstance(ua, str):
+            ua = ""
+        ua = ua.strip()
         ua_field = ua if ua else "null"
 
         # 第一列 = 磁盘真实文件名，直接复用，不做二次计算
