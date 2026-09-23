@@ -2,7 +2,7 @@ name: 每日聚合TVBox直播源
 
 on:
   schedule:
-    - cron: "0 18 * * *"   # UTC 18:00 = 北京时间次日 02:00
+    - cron: "0 18 * * *" # UTC 18:00 = 北京时间次日 02:00
   workflow_dispatch:
     inputs:
       force:
@@ -26,6 +26,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,18 +40,29 @@ jobs:
       - name: 安装依赖
         run: pip install requests urllib3
 
+      # 注意：脚本文件名为中文，run 脚本由 runner 以 UTF-8 写入，正常可执行。
+      # 若担心本地 Windows 端 CRLF/编码问题，建议把脚本重命名为 ASCII 名（如 python/live_downloader.py）。
       - name: 运行 live下载器
+        env:
+          DEBUG: ${{ inputs.debug }}
+          FORCE: ${{ inputs.force }}
         run: |
-          ARGS=""
-          ${{ github.event.inputs.debug == 'true' && 'ARGS="$ARGS --debug"' || '' }}
-          ${{ github.event.inputs.force == 'true' && 'ARGS="$ARGS --force"' || '' }}
-          python python/live下载器.py $ARGS
+          args=()
+          if [ "$DEBUG" = "true" ]; then args+=(--debug); fi
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          python "python/live下载器.py" "${args[@]}"
 
       - name: 提交产物
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase --autostash
-          git add tvbox/ livelist.txt
-          git commit -m "chore(live): 每日更新直播源 $(TZ='CST-8' date +%Y-%m-%d)" || echo "no changes"
-          git push
+          for p in tvbox livelist.txt; do
+            if [ -e "$p" ]; then git add -A -- "$p"; fi
+          done
+          if git diff --cached --quiet; then
+            echo "产物无变更，跳过提交" >> "$GITHUB_STEP_SUMMARY"
+          else
+            git commit -m "chore(live): 每日更新直播源 $(TZ='CST-8' date +%Y-%m-%d)"
+            git push
+          fi
